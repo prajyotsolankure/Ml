@@ -28,7 +28,6 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-import unicodedata
 from pathlib import Path
 
 # Only enforce strict offline mode if we are NOT running the installer
@@ -135,14 +134,9 @@ def cli_install_packages():
     print("\n--- 3. Downloading OPUS-MT Models (Telugu, Tamil, Kannada) ---")
     try:
         from transformers import MarianMTModel, MarianTokenizer
-        # Dedicated models provide vastly superior translation accuracy for South Indian languages,
-        # with fallback to the multilingual models if needed.
         marian_models = [
-            "Helsinki-NLP/opus-mt-en-te",   # English → Telugu (dedicated, high accuracy)
-            "Helsinki-NLP/opus-mt-en-ta",   # English → Tamil (dedicated, high accuracy)
-            "Helsinki-NLP/opus-mt-en-kn",   # English → Kannada (dedicated, high accuracy)
+            "Helsinki-NLP/opus-mt-en-dra",   # English → Dravidian (te, ta, kn)
             "Helsinki-NLP/opus-mt-dra-en",   # Dravidian → English
-            "Helsinki-NLP/opus-mt-en-dra",   # English → Dravidian (multilingual fallback)
         ]
         for model_name in marian_models:
             print(f"  Downloading {model_name} ...")
@@ -153,24 +147,16 @@ def cli_install_packages():
             except Exception as e:
                 print(f"  [FAIL] {model_name}: {e}")
 
-        # Warm up with dummy translations to ensure all models are cached and ready
+        # Warm up with a dummy translation to ensure everything is cached
         print("  Warming up MarianMT models ...")
-        warmup_tests = [
-            ("Helsinki-NLP/opus-mt-en-te", "Hello world."),
-            ("Helsinki-NLP/opus-mt-en-ta", "Hello world."),
-            ("Helsinki-NLP/opus-mt-en-kn", "Hello world."),
-            ("Helsinki-NLP/opus-mt-dra-en", "నమస్కారం"),
-            ("Helsinki-NLP/opus-mt-en-dra", ">>tel<< Hello world."),
-        ]
-        for mdl_name, test_input in warmup_tests:
-            try:
-                tok = MarianTokenizer.from_pretrained(mdl_name)
-                mdl = MarianMTModel.from_pretrained(mdl_name)
-                inputs = tok(test_input, return_tensors="pt", padding=True)
-                mdl.generate(**inputs, max_new_tokens=30, num_beams=2)
-                print(f"  [OK] MarianMT warm-up complete for {mdl_name}")
-            except Exception as e:
-                print(f"  [SKIP] MarianMT warm-up {mdl_name}: {e}")
+        try:
+            tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-dra")
+            mdl = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-dra")
+            inputs = tok(">>tel<< Hello world.", return_tensors="pt", padding=True)
+            mdl.generate(**inputs)
+            print("  [OK] MarianMT warm-up complete")
+        except Exception as e:
+            print(f"  [FAIL] MarianMT warm-up: {e}")
     except ImportError:
         print("  [SKIP] transformers not installed. Run: pip install transformers sentencepiece")
 
@@ -260,7 +246,7 @@ if "--install-packages" not in sys.argv:
         #   - whitespace + digit (numbered lists)
         #   - whitespace + quote mark
         parts = _re.split(
-            r'(?<=[.!?।])\s+'
+            r'(?<=[.!?])\s+'
             r'(?=['
             r'A-Z'                   # Latin uppercase
             r'\u0900-\u097F'         # Devanagari (Hindi)
@@ -268,7 +254,6 @@ if "--install-packages" not in sys.argv:
             r'\u0C00-\u0C7F'         # Telugu
             r'\u0B80-\u0BFF'         # Tamil
             r'\u0C80-\u0CFF'         # Kannada
-            r'\u0D00-\u0D7F'         # Malayalam
             r'0-9'                   # Numbered items
             r'"\u201C\u201D'         # Quotation marks
             r"'"                     # Apostrophe/single quote
@@ -388,54 +373,18 @@ except ImportError:
 
 DISPLAY_W   = 480
 DISPLAY_H   = 320
-FS_TITLE    = 10
-FS_LABEL    = 9
+FS_TITLE    = 9
+FS_LABEL    = 8
 FS_LANG     = 10
-FS_TEXT     = 10
-FS_BTN      = 9
-FS_STATUS   = 8
-FS_CHAR     = 8
-FS_DIR      = 8
+FS_TEXT     = 9
+FS_BTN      = 8
+FS_STATUS   = 7
+FS_CHAR     = 7
+FS_DIR      = 7
 INPUT_ROWS  = 3
 OUTPUT_ROWS = 3
 BTN_PADY    = 3
 BTN_PADX    = 10
-
-_BEST_FONT_FAMILY = None
-
-def get_ui_font(size: int, weight: str = "normal"):
-    """Return an OpenType font family that properly renders complex Indic scripts."""
-    global _BEST_FONT_FAMILY
-    if _BEST_FONT_FAMILY is None:
-        try:
-            import tkinter.font as tkfont
-            avail = set(tkfont.families())
-            candidates = [
-                "Nirmala UI",          # Windows standard with complete Indic OpenType layout
-                "Noto Sans",           # Linux / Raspberry Pi OS standard
-                "Noto Sans Telugu",    # Specific Indic Noto fonts
-                "Noto Sans Tamil",
-                "Noto Sans Kannada",
-                "Noto Sans Devanagari",
-                "Lohit Telugu",        # Lohit Indic fonts (common on Debian/RPi)
-                "Lohit Tamil",
-                "Lohit Kannada",
-                "DejaVu Sans",         # Linux standard proportional
-                "Segoe UI",            # Windows standard proportional
-                "Arial",
-            ]
-            for c in candidates:
-                if c in avail:
-                    _BEST_FONT_FAMILY = c
-                    break
-            if not _BEST_FONT_FAMILY:
-                _BEST_FONT_FAMILY = "TkDefaultFont"
-        except Exception:
-            _BEST_FONT_FAMILY = "TkDefaultFont"
-
-    if weight and weight != "normal":
-        return (_BEST_FONT_FAMILY, size, weight)
-    return (_BEST_FONT_FAMILY, size)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -500,14 +449,7 @@ VOSK_MODELS_DIR = Path.home() / "vosk-models"
 # Languages that use MarianMT (OPUS-MT) instead of Argos Translate
 MARIAN_LANGUAGES = {"te", "ta", "kn"}
 
-# Dedicated English → Language models (vastly higher accuracy and grammatical correctness)
-MARIAN_DEDICATED_MODELS = {
-    "te": "Helsinki-NLP/opus-mt-en-te",
-    "ta": "Helsinki-NLP/opus-mt-en-ta",
-    "kn": "Helsinki-NLP/opus-mt-en-kn",
-}
-
-# Fallback OPUS-MT target language tokens for the multilingual en→dra model
+# OPUS-MT target language tokens for the en→dra model
 MARIAN_LANG_TOKENS = {
     "te": ">>tel<<",
     "ta": ">>tam<<",
@@ -515,7 +457,7 @@ MARIAN_LANG_TOKENS = {
 }
 
 # Model names on HuggingFace (downloaded once, then cached locally)
-MARIAN_MODEL_EN_DRA = "Helsinki-NLP/opus-mt-en-dra"   # English → Dravidian fallback
+MARIAN_MODEL_EN_DRA = "Helsinki-NLP/opus-mt-en-dra"   # English → Dravidian
 MARIAN_MODEL_DRA_EN = "Helsinki-NLP/opus-mt-dra-en"   # Dravidian → English
 
 
@@ -523,41 +465,16 @@ MARIAN_MODEL_DRA_EN = "Helsinki-NLP/opus-mt-dra-en"   # Dravidian → English
 #  TEXT PRE / POST-PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _clean_indic_orthography(text: str) -> str:
-    """Normalize and re-attach detached matras, combining vowels, and viramas in Indic scripts.
-
-    SentencePiece subword tokenization frequently breaks Indic syllables by placing spaces
-    before dependent vowel signs (matras), anusvara, or after viramas (halants/ottu).
-    This function restores correct composite glyphs and canonical Unicode (NFC).
-    """
-    if not text:
-        return text
-    # 1. Canonical Unicode composition normalization
-    text = unicodedata.normalize("NFC", text)
-    # 2. Re-attach dependent vowels (matras), anusvara, visarga, and viramas to preceding consonants
-    text = _re.sub(
-        r'[ \t]+([\u0901-\u094D\u0962\u0963\u0B82\u0BBE-\u0BCD\u0BD7\u0C01-\u0C03\u0C3E-\u0C4D\u0C55\u0C56\u0C81-\u0C83\u0CBE-\u0CCD\u0CD5\u0CD6\u0D01-\u0D03\u0D3E-\u0D4D\u0D57])',
-        r'\1',
-        text
-    )
-    # 3. Remove space after viramas (halants) so that consonants fuse into valid conjuncts (ottu)
-    text = _re.sub(r'([\u094D\u0BCD\u0C4D\u0CCD\u0D4D])[ \t]+', r'\1', text)
-    # 4. Strip invisible control characters that break complex text layout
-    text = text.replace('\u200b', '').replace('\ufeff', '')
-    return text
-
-
 def _preprocess_text(text: str) -> str:
     """Normalise whitespace and clean input before translation."""
     if not text:
         return text
-    text = _clean_indic_orthography(text)
     # Collapse runs of spaces/tabs into single space
     text = _re.sub(r'[ \t]+', ' ', text)
     # Collapse 3+ newlines into double newline (paragraph break)
     text = _re.sub(r'\n{3,}', '\n\n', text)
-    # Ensure space after sentence-ending punctuation if missing (supports Latin, Hindi, CJK, Telugu, Tamil, Kannada, Malayalam)
-    text = _re.sub(r'([.!?।])([A-Z\u0900-\u097F\u4e00-\u9fff\u0C00-\u0C7F\u0B80-\u0BFF\u0C80-\u0CFF\u0D00-\u0D7F])', r'\1 \2', text)
+    # Ensure space after sentence-ending punctuation if missing
+    text = _re.sub(r'([.!?])([A-Z\u0900-\u097F\u4e00-\u9fff\u0C00-\u0C7F\u0B80-\u0BFF\u0C80-\u0CFF])', r'\1 \2', text)
     return text.strip()
 
 
@@ -565,22 +482,19 @@ def _postprocess_text(text: str) -> str:
     """Clean up common translation artifacts."""
     if not text:
         return text
-    # Remove any leaked model target tokens (e.g. >>tel<<, >>tam<<, >>kan<<)
-    text = _re.sub(r'>>[a-zA-Z_-]+<<', '', text)
     # Fix multiple consecutive spaces
     text = _re.sub(r'  +', ' ', text)
     # Remove stray spaces before punctuation
-    text = _re.sub(r'\s+([.!?,;:。！？，；：।])', r'\1', text)
+    text = _re.sub(r'\s+([.!?,;:。！？，；：])', r'\1', text)
     # Add space after punctuation when directly followed by a word char
+    # (but not for decimal numbers or abbreviations)
     text = _re.sub(
-        r'([.!?,;:।])([A-Za-z\u0900-\u097F\u4e00-\u9fff\u0C00-\u0C7F\u0B80-\u0BFF\u0C80-\u0CFF\u0D00-\u0D7F])',
+        r'([.!?,;:])([A-Za-z\u0900-\u097F\u4e00-\u9fff\u0C00-\u0C7F\u0B80-\u0BFF\u0C80-\u0CFF])',
         r'\1 \2',
         text
     )
     # Fix repeated punctuation from model artifacts (e.g. "....." → "...")
-    text = _re.sub(r'([.!?।])\1{2,}', r'\1\1\1', text)
-    # Restore correct Indic orthography, combining marks, and conjuncts
-    text = _clean_indic_orthography(text)
+    text = _re.sub(r'([.!?])\1{2,}', r'\1\1\1', text)
     return text.strip()
 
 
@@ -589,78 +503,25 @@ def _postprocess_text(text: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _translation_cache: dict = {}
-_marian_availability_cache: dict = {}
-
-
-def _is_marian_model_available(model_name: str) -> bool:
-    """Check if MarianMT model files exist locally in Hugging Face cache (zero network calls)."""
-    if not MARIAN_AVAILABLE:
-        return False
-    if model_name in _marian_availability_cache:
-        return _marian_availability_cache[model_name]
-    if model_name in _marian_model_cache:
-        _marian_availability_cache[model_name] = True
-        return True
-    try:
-        MarianTokenizer.from_pretrained(model_name, local_files_only=True)
-        _marian_availability_cache[model_name] = True
-        return True
-    except Exception:
-        _marian_availability_cache[model_name] = False
-        return False
-
-
-def _is_marian_tgt_available(tgt_code: str) -> bool:
-    """Check if any model capable of translating English to tgt_code is available offline."""
-    dedicated = MARIAN_DEDICATED_MODELS.get(tgt_code)
-    if dedicated and _is_marian_model_available(dedicated):
-        return True
-    return _is_marian_model_available(MARIAN_MODEL_EN_DRA)
-
-
-def _is_argos_pair_installed(src_code: str, tgt_code: str) -> bool:
-    try:
-        installed = argostranslate.translate.get_installed_languages()
-        src_lang = next((l for l in installed if l.code == src_code), None)
-        tgt_lang = next((l for l in installed if l.code == tgt_code), None)
-        if src_lang is None or tgt_lang is None:
-            return False
-        return src_lang.get_translation(tgt_lang) is not None
-    except Exception:
-        return False
-
 
 # ── Argos Translate helpers (for en/hi/fr/zh/es/de) ──────────────────────────
 
 def _is_pair_installed(src_code: str, tgt_code: str) -> bool:
     """Check if a translation pair is ready (Argos or MarianMT)."""
-    if src_code == tgt_code:
-        return True
-
     src_marian = src_code in MARIAN_LANGUAGES
     tgt_marian = tgt_code in MARIAN_LANGUAGES
 
-    # Both are Dravidian (e.g. te→ta): requires dra→en and en→tgt
-    if src_marian and tgt_marian:
-        if not MARIAN_AVAILABLE:
-            return False
-        return _is_marian_model_available(MARIAN_MODEL_DRA_EN) and _is_marian_tgt_available(tgt_code)
+    # If either language is Dravidian, use MarianMT
+    if src_marian or tgt_marian:
+        return MARIAN_AVAILABLE
 
-    # Source is Dravidian (e.g. te→hi): requires dra→en, then Argos en→tgt
-    if src_marian and not tgt_marian:
-        if not MARIAN_AVAILABLE or not _is_marian_model_available(MARIAN_MODEL_DRA_EN):
-            return False
-        return True if tgt_code == "en" else _is_argos_pair_installed("en", tgt_code)
-
-    # Target is Dravidian (e.g. hi→te): requires Argos src→en, then en→tgt
-    if tgt_marian and not src_marian:
-        if not MARIAN_AVAILABLE or not _is_marian_tgt_available(tgt_code):
-            return False
-        return True if src_code == "en" else _is_argos_pair_installed(src_code, "en")
-
-    # Pure Argos pairs
-    return _is_argos_pair_installed(src_code, tgt_code)
-
+    # Otherwise check Argos
+    installed = argostranslate.translate.get_installed_languages()
+    src_lang = next((l for l in installed if l.code == src_code), None)
+    tgt_lang = next((l for l in installed if l.code == tgt_code), None)
+    if src_lang is None or tgt_lang is None:
+        return False
+    return src_lang.get_translation(tgt_lang) is not None
 
 def _get_translation_obj(src_code: str, tgt_code: str):
     key = (src_code, tgt_code)
@@ -696,9 +557,7 @@ def _load_marian_model(model_name: str):
     try:
         tokenizer = MarianTokenizer.from_pretrained(model_name, local_files_only=True)
         model = MarianMTModel.from_pretrained(model_name, local_files_only=True)
-        model.eval()
         _marian_model_cache[model_name] = (tokenizer, model)
-        _marian_availability_cache[model_name] = True
         return (tokenizer, model)
     except Exception as e:
         print(f"[MarianMT load error for {model_name}]: {e}")
@@ -706,7 +565,12 @@ def _load_marian_model(model_name: str):
 
 
 def _marian_translate(text: str, model_name: str, lang_token: str = "") -> str:
-    """Translate using a MarianMT model with context-aware chunking."""
+    """Translate using a MarianMT model with context-aware chunking.
+
+    For short text:  translate as a single unit (best quality).
+    For long text:   split into sentence-grouped chunks, translate each,
+                     and rejoin with proper spacing.
+    """
     pair = _load_marian_model(model_name)
     if pair is None:
         return (
@@ -716,54 +580,42 @@ def _marian_translate(text: str, model_name: str, lang_token: str = "") -> str:
     tokenizer, model = pair
 
     text = _preprocess_text(text)
-    if not text:
-        return ""
 
     def _translate_chunk(chunk: str) -> str:
         """Translate a single chunk through MarianMT."""
         src_text = f"{lang_token} {chunk}".strip() if lang_token else chunk
         print(f"[MarianMT] Input: '{src_text}' | Model: {model_name}")
 
-        try:
-            inputs = tokenizer(
-                src_text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-            # no_repeat_ngram_size is intentionally omitted: Dravidian languages use
-            # frequent subword repetitions in regular morphology; setting n-gram bans
-            # causes severe word corruption and abrupt truncation.
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                num_beams=4,
-                length_penalty=1.0,
-                early_stopping=True,
-            )
-            result = tokenizer.decode(outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            if lang_token:
-                result = result.replace(lang_token.strip(), "")
-            result = _re.sub(r'>>[a-zA-Z_-]+<<', '', result).strip()
-            result = _clean_indic_orthography(result)
-            print(f"[MarianMT] Output: '{result}'")
+        inputs = tokenizer(
+            src_text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=1024,
+            num_beams=5,
+            length_penalty=1.0,
+            no_repeat_ngram_size=3,
+            early_stopping=True,
+        )
+        result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(f"[MarianMT] Output: '{result}'")
 
-            if result and result.strip():
-                return result.strip()
+        if result and result.strip():
+            return result.strip()
 
-            # Fallback: try decoding without skipping special tokens if result is empty
-            raw = tokenizer.decode(outputs[0], skip_special_tokens=False, clean_up_tokenization_spaces=True)
-            if raw and raw.strip():
-                for tok in ["</s>", "<pad>", "<s>", "<unk>"]:
-                    raw = raw.replace(tok, "")
-                raw = _re.sub(r'>>[a-zA-Z_-]+<<', '', raw).strip()
-                if raw.strip():
-                    return raw.strip()
-            return ""
-        except Exception as e:
-            print(f"[MarianMT translation chunk error]: {e}")
-            return ""
+        # Fallback: try without skipping special tokens to see raw output
+        raw = tokenizer.decode(outputs[0], skip_special_tokens=False)
+        print(f"[MarianMT] Raw output: '{raw}'")
+        if raw and raw.strip():
+            for tok in ["</s>", "<pad>", "<s>", "<unk>"]:
+                raw = raw.replace(tok, "")
+            if raw.strip():
+                return raw.strip()
+        return ""
 
     # SHORT TEXT (< 400 chars): translate as one unit for best context
     if len(text) < 400:
@@ -773,10 +625,12 @@ def _marian_translate(text: str, model_name: str, lang_token: str = "") -> str:
         return "[No result — model may not support this language pair]"
 
     # LONGER TEXT: split into smart chunks and translate each
+    # Preserve paragraph structure
     paragraphs = _re.split(r'(\n\s*\n)', text)
     translated_parts = []
 
     for part in paragraphs:
+        # Preserve paragraph break whitespace as-is
         if not part.strip():
             translated_parts.append(part)
             continue
@@ -785,6 +639,7 @@ def _marian_translate(text: str, model_name: str, lang_token: str = "") -> str:
             result = _translate_chunk(part)
             translated_parts.append(result if result else part)
         else:
+            # Split into sentences and group into chunks
             sentences = _robust_sentence_split(part)
             chunks = _group_sentences(sentences, max_chunk_chars=350)
             chunk_results = []
@@ -797,25 +652,6 @@ def _marian_translate(text: str, model_name: str, lang_token: str = "") -> str:
     if final.strip():
         return _postprocess_text(final)
     return "[No result — model may not support this language pair]"
-
-
-def _translate_en_to_dravidian(english_text: str, tgt_code: str) -> str:
-    """Translate English into a Dravidian language (te, ta, kn).
-
-    Prefers dedicated single-language models (Helsinki-NLP/opus-mt-en-te,
-    opus-mt-en-ta, opus-mt-en-kn) for vastly superior translation quality.
-    Gracefully falls back to multilingual Helsinki-NLP/opus-mt-en-dra if
-    the dedicated model is not cached.
-    """
-    dedicated_model = MARIAN_DEDICATED_MODELS.get(tgt_code)
-    if dedicated_model and _is_marian_model_available(dedicated_model):
-        res = _marian_translate(english_text, dedicated_model, lang_token="")
-        if res and not res.startswith("["):
-            return res
-
-    # Fallback to shared multilingual Dravidian model (en-dra)
-    token = MARIAN_LANG_TOKENS.get(tgt_code, "")
-    return _marian_translate(english_text, MARIAN_MODEL_EN_DRA, token)
 
 
 # ── Unified translate function ───────────────────────────────────────────────
@@ -832,15 +668,16 @@ def do_translate(text: str, src_code: str, tgt_code: str) -> str:
         # Case 1: Both are Dravidian → pivot through English (te→en→ta)
         if src_marian and tgt_marian:
             english = _marian_translate(text, MARIAN_MODEL_DRA_EN)
-            if not english or english.startswith("["):
-                return english if english else "[Translation failed: could not translate to English]"
-            return _translate_en_to_dravidian(english, tgt_code)
+            if english.startswith("["):
+                return english  # Error
+            token = MARIAN_LANG_TOKENS.get(tgt_code, "")
+            return _marian_translate(english, MARIAN_MODEL_EN_DRA, token)
 
         # Case 2: Source is Dravidian → translate to English first, then Argos
         if src_marian and not tgt_marian:
             english = _marian_translate(text, MARIAN_MODEL_DRA_EN)
-            if not english or english.startswith("["):
-                return english if english else "[Translation failed: could not translate to English]"
+            if english.startswith("["):
+                return english
             if tgt_code == "en":
                 return english
             # English → target via Argos
@@ -852,9 +689,10 @@ def do_translate(text: str, src_code: str, tgt_code: str) -> str:
                 english = text
             else:
                 english = _argos_translate(text, src_code, "en")
-                if not english or english.startswith("["):
-                    return english if english else "[Translation failed: could not translate to English]"
-            return _translate_en_to_dravidian(english, tgt_code)
+                if english.startswith("["):
+                    return english
+            token = MARIAN_LANG_TOKENS.get(tgt_code, "")
+            return _marian_translate(english, MARIAN_MODEL_EN_DRA, token)
 
         # Case 4: Neither is Dravidian → pure Argos
         return _argos_translate(text, src_code, tgt_code)
@@ -1220,7 +1058,7 @@ class OffLingoApp:
 
         tk.Label(
             row1, text="◉ OffLingo",
-            font=get_ui_font(FS_TITLE, "bold"),
+            font=("TkFixedFont", FS_TITLE, "bold"),
             fg=C["fg"], bg=C["bg"]
         ).pack(side="left", padx=(0, 6))
 
@@ -1228,7 +1066,7 @@ class OffLingoApp:
 
         swap = tk.Label(
             row1, text="⇄",
-            font=get_ui_font(11, "bold"), fg=C["fg"], bg=C["btn_dark"],
+            font=("TkFixedFont", 11), fg=C["fg"], bg=C["btn_dark"],
             width=2, cursor="hand2", relief="flat", padx=4, pady=2
         )
         swap.pack(side="left", padx=3)
@@ -1239,7 +1077,7 @@ class OffLingoApp:
 
         exit_btn = tk.Label(
             row1, text="✖",
-            font=get_ui_font(11, "bold"), fg=C["err"], bg=C["bg"],
+            font=("TkFixedFont", 11, "bold"), fg=C["err"], bg=C["bg"],
             cursor="hand2", padx=4
         )
         exit_btn.pack(side="right", padx=(4, 0))
@@ -1247,7 +1085,7 @@ class OffLingoApp:
 
         min_btn = tk.Label(
             row1, text="—",
-            font=get_ui_font(11, "bold"), fg=C["fg"], bg=C["bg"],
+            font=("TkFixedFont", 11, "bold"), fg=C["fg"], bg=C["bg"],
             cursor="hand2", padx=4
         )
         min_btn.pack(side="right", padx=(4, 4))
@@ -1255,7 +1093,7 @@ class OffLingoApp:
 
         self.dir_label = tk.Label(
             row1, text="",
-            font=get_ui_font(FS_DIR),
+            font=("TkFixedFont", FS_DIR),
             fg=C["fg_dim"], bg=C["bg"]
         )
         self.dir_label.pack(side="right", padx=(4, 0))
@@ -1275,7 +1113,7 @@ class OffLingoApp:
         self.input_text = tk.Text(
             in_wrap,
             height=INPUT_ROWS,
-            font=get_ui_font(FS_TEXT),
+            font=("TkFixedFont", FS_TEXT),
             fg=C["fg"], bg=C["bg_input"],
             insertbackground=C["fg"],
             selectbackground=C["border"],
@@ -1308,7 +1146,7 @@ class OffLingoApp:
         if self.voice_ok:
             self.mic_btn = tk.Label(
                 btn_row, text="🎙 SPEAK",
-                font=get_ui_font(FS_BTN),
+                font=("TkFixedFont", FS_BTN),
                 fg=C["fg"], bg=C["btn_record"],
                 padx=BTN_PADX, pady=BTN_PADY, cursor="hand2"
             )
@@ -1317,7 +1155,7 @@ class OffLingoApp:
         else:
             tk.Label(
                 btn_row, text="🎙 –",
-                font=get_ui_font(FS_BTN, "italic"),
+                font=("TkFixedFont", FS_BTN, "italic"),
                 fg=C["fg_dim"], bg=C["bg"]
             ).pack(side="left", padx=(3, 0))
 
@@ -1330,7 +1168,7 @@ class OffLingoApp:
 
         self.char_count = tk.Label(
             btn_row, text="0",
-            font=get_ui_font(FS_CHAR),
+            font=("TkFixedFont", FS_CHAR),
             fg=C["fg_dim"], bg=C["bg"]
         )
         self.char_count.pack(side="right", padx=(0, 2))
@@ -1345,7 +1183,7 @@ class OffLingoApp:
         self.output_text = tk.Text(
             out_wrap,
             height=OUTPUT_ROWS,
-            font=get_ui_font(FS_TEXT),
+            font=("TkFixedFont", FS_TEXT),
             fg=C["fg"], bg=C["bg_output"],
             relief="flat", bd=3,
             wrap="word",
@@ -1360,13 +1198,13 @@ class OffLingoApp:
         st.pack(fill="x")
         self.status_lbl = tk.Label(
             st, text="Ready",
-            font=get_ui_font(FS_STATUS),
+            font=("TkFixedFont", FS_STATUS),
             fg=C["fg_dim"], bg=C["bg"], anchor="w"
         )
         self.status_lbl.pack(side="left")
         self.model_lbl = tk.Label(
             st, text="",
-            font=get_ui_font(FS_STATUS),
+            font=("TkFixedFont", FS_STATUS),
             fg=C["fg_dim"], bg=C["bg"], anchor="e"
         )
         self.model_lbl.pack(side="right")
@@ -1379,7 +1217,7 @@ class OffLingoApp:
 
         tk.Label(
             container, text=label_text,
-            font=get_ui_font(FS_LABEL, "bold"),
+            font=("TkFixedFont", FS_LABEL, "bold"),
             fg=C["fg_dim"], bg=C["bg"]
         ).pack(anchor="w")
 
@@ -1393,7 +1231,7 @@ class OffLingoApp:
 
         btn = tk.Menubutton(
             sf, textvariable=var,
-            font=get_ui_font(FS_LANG),
+            font=("TkFixedFont", FS_LANG),
             fg=C["fg"], bg=C["bg_input"],
             activebackground=C["btn_dark_hov"],
             activeforeground=C["fg"],
@@ -1404,7 +1242,7 @@ class OffLingoApp:
         )
         menu = tk.Menu(
             btn, tearoff=False,
-            font=get_ui_font(FS_LANG),
+            font=("TkFixedFont", FS_LANG),
             fg=C["fg"], bg=C["bg2"],
             activebackground=C["btn_primary"],
             activeforeground=C["fg_btn"],
@@ -1421,7 +1259,7 @@ class OffLingoApp:
     def _make_btn(self, parent, text, bg, bg_hov, fg, cmd, side="left", padx_l=0):
         lbl = tk.Label(
             parent, text=text,
-            font=get_ui_font(FS_BTN, "bold"),
+            font=("TkFixedFont", FS_BTN, "bold"),
             fg=fg, bg=bg,
             padx=BTN_PADX, pady=BTN_PADY,
             cursor="hand2"
@@ -1579,7 +1417,6 @@ class OffLingoApp:
         self._recording = False
 
     def _set_input_text(self, text: str):
-        text = _clean_indic_orthography(text)
         self.input_text.delete("1.0", "end")
         self.input_text.insert("1.0", text)
 
@@ -1610,7 +1447,6 @@ class OffLingoApp:
         self.input_text.focus_set()
 
     def _set_output(self, text: str):
-        text = _clean_indic_orthography(text)
         self.output_text.configure(state="normal")
         self.output_text.delete("1.0", "end")
         self.output_text.insert("1.0", text)
