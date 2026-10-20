@@ -11,11 +11,13 @@ Features:
   ✦ Speech Output – Piper TTS / espeak-ng fallback
   ✦ Keyboard Input
   ✦ ZERO network calls during translation
-  ✦ MarianMT (OPUS-MT) for Telugu/Tamil/Kannada
+  ✦ NLLB-200 (distilled 600M) for Telugu/Tamil/Kannada  (direct, no pivot)
+  ✦ Argos Translate for en/hi/fr/zh/es/de (unchanged)
   ✦ Context-aware chunking for better sentence/paragraph translation
 
 Pre-install packages (run ONCE while online):
     cd /home/pns/Desktop/Trasnlator
+    ./lingo_env/bin/pip install ctranslate2 transformers sentencepiece huggingface_hub
     ./lingo_env/bin/python test2.py --install-packages
 """
 
@@ -37,16 +39,7 @@ if "--install-packages" not in sys.argv:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["HF_DATASETS_OFFLINE"] = "1"
 
-    # ── FIX 1: Block Stanza import ─────────────────────────────────────
-    # Stanza (used by argostranslate for sentence splitting) silently
-    # downloads NLP tokenizer models on first use.  Blocking the import
-    # forces argostranslate to use its built-in regex sentence splitter.
-
-    # ── FIX 2: Block ALL outgoing network connections ──────────────────
-    # Some libraries (stanza, sentencepiece, huggingface hub, argos
-    # internals) sneak in downloads on first use even with env vars set.
-    # We monkey-patch socket.create_connection so that NO library can
-    # open an internet connection.  Localhost is still allowed.
+    # Block ALL outgoing network connections (localhost still allowed).
     import socket as _socket
     _real_create_connection = _socket.create_connection
 
@@ -60,6 +53,34 @@ if "--install-packages" not in sys.argv:
         )
 
     _socket.create_connection = _blocked_create_connection
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NLLB CONFIG (Telugu / Tamil / Kannada)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Languages handled by NLLB instead of Argos
+DRAVIDIAN_LANGUAGES = {"te", "ta", "kn"}
+
+# Pre-converted CTranslate2 int8 build of NLLB-200 distilled 600M (~600 MB,
+# ~0.7 GB RAM) — fits on a 2 GB Raspberry Pi. Tokenizer files are included.
+NLLB_REPO = "Code-Dev/nllb-200-distilled-600M-ct2-int8"
+NLLB_DIR  = Path.home() / "nllb-ct2"
+NLLB_MODEL = str(NLLB_DIR)   # key used for the in-memory cache
+
+# App language code -> NLLB (FLORES-200) code
+NLLB_CODES = {
+    "en": "eng_Latn",
+    "hi": "hin_Deva",
+    "fr": "fra_Latn",
+    "zh": "zho_Hans",
+    "es": "spa_Latn",
+    "de": "deu_Latn",
+    "te": "tel_Telu",
+    "ta": "tam_Taml",
+    "kn": "kan_Knda",
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CLI: pre-install packages (run once while online)
@@ -95,8 +116,6 @@ def cli_install_packages():
             print(f"  [FAIL] {src}→{tgt}: {e}")
 
     print("\n--- 2. Downloading Stanza NLP Models (Crucial for offline) ---")
-
-    # Step 2a: Explicitly download Stanza tokenizer resources per language
     try:
         import stanza
         stanza_lang_map = {
@@ -113,13 +132,12 @@ def cli_install_packages():
     except ImportError:
         print("  [INFO] stanza not installed — app will use regex sentence splitter (that's fine)")
 
-    # Step 2b: Warm up by doing dummy translations (caches any remaining resources)
     print("  Warming up translation models with dummy translations...")
     installed = argostranslate.translate.get_installed_languages()
     for src, tgt in pairs:
         src_lang = next((l for l in installed if l.code == src), None)
         tgt_lang = next((l for l in installed if l.code == tgt), None)
-        
+
         if src_lang and tgt_lang:
             translator = src_lang.get_translation(tgt_lang)
             if translator:
@@ -130,35 +148,38 @@ def cli_install_packages():
                 except Exception as e:
                     print(f"  [FAIL] Warmup {src}→{tgt}: {e}")
 
-    # ── 3. Download OPUS-MT (MarianMT) models for Telugu, Tamil, Kannada ──
-    print("\n--- 3. Downloading OPUS-MT Models (Telugu, Tamil, Kannada) ---")
+    # ── 3. Download NLLB-200 for Telugu, Tamil, Kannada ──
+    print("\n--- 3. Downloading NLLB-200 int8 (Telugu, Tamil, Kannada) ---")
+    print(f"     (about 600 MB → {NLLB_DIR})")
     try:
-        from transformers import MarianMTModel, MarianTokenizer
-        marian_models = [
-            "Helsinki-NLP/opus-mt-en-dra",   # English → Dravidian (te, ta, kn)
-            "Helsinki-NLP/opus-mt-dra-en",   # Dravidian → English
-        ]
-        for model_name in marian_models:
-            print(f"  Downloading {model_name} ...")
-            try:
-                MarianTokenizer.from_pretrained(model_name)
-                MarianMTModel.from_pretrained(model_name)
-                print(f"  [OK]   {model_name}")
-            except Exception as e:
-                print(f"  [FAIL] {model_name}: {e}")
+        from huggingface_hub import snapshot_download
+        import ctranslate2
+        from transformers import AutoTokenizer
 
-        # Warm up with a dummy translation to ensure everything is cached
-        print("  Warming up MarianMT models ...")
-        try:
-            tok = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-dra")
-            mdl = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-dra")
-            inputs = tok(">>tel<< Hello world.", return_tensors="pt", padding=True)
-            mdl.generate(**inputs)
-            print("  [OK] MarianMT warm-up complete")
-        except Exception as e:
-            print(f"  [FAIL] MarianMT warm-up: {e}")
-    except ImportError:
-        print("  [SKIP] transformers not installed. Run: pip install transformers sentencepiece")
+        # Files are written straight to disk — no big in-RAM model rebuild.
+        snapshot_download(repo_id=NLLB_REPO, local_dir=str(NLLB_DIR))
+        print(f"  [OK]   {NLLB_REPO}")
+
+        print("  Warming up NLLB for te / ta / kn ...")
+        tok = AutoTokenizer.from_pretrained(str(NLLB_DIR))
+        tr = ctranslate2.Translator(str(NLLB_DIR), device="cpu", compute_type="int8")
+        for code in ("te", "ta", "kn"):
+            try:
+                tok.src_lang = NLLB_CODES["en"]
+                toks = tok.convert_ids_to_tokens(tok("Hello, how are you?").input_ids)
+                res = tr.translate_batch([toks], target_prefix=[[NLLB_CODES[code]]])
+                hyp = res[0].hypotheses[0]
+                if hyp and hyp[0] == NLLB_CODES[code]:
+                    hyp = hyp[1:]
+                print(f"  [OK]   en→{code}: "
+                      f"{tok.decode(tok.convert_tokens_to_ids(hyp), skip_special_tokens=True)}")
+            except Exception as e:
+                print(f"  [FAIL] NLLB warm-up en→{code}: {e}")
+    except ImportError as e:
+        print(f"  [SKIP] missing package ({e}). "
+              "Run: pip install ctranslate2 transformers sentencepiece huggingface_hub")
+    except Exception as e:
+        print(f"  [FAIL] {NLLB_REPO}: {e}")
 
     print("\nDone! All packages and NLP models installed. App will now work fully offline.")
     sys.exit(0)
@@ -181,14 +202,10 @@ except ImportError:
     print("[ERROR] argostranslate not found. Run: pip install argostranslate")
     sys.exit(1)
 
-# ── FIX: Replace Stanza sentence splitter with offline regex splitter ──
-# Stanza downloads resources.json from raw.githubusercontent.com on every
-# first use.  We replace argostranslate's sentence boundary detection with
-# a smart context-aware splitter that works 100% offline, no downloads ever.
+# ── Replace Stanza sentence splitter with offline regex splitter ──
 if "--install-packages" not in sys.argv:
     import argostranslate.sbd as _sbd
 
-    # ── Common abbreviations that must NOT trigger sentence splits ────
     _ABBREV_PATTERN = (
         r'(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Gen|Gov|Sgt|Corp|Inc|Ltd|Rev|'
         r'Vol|Fig|Dept|Est|Approx|Rep|Sec|Capt|Col|Cmdr|Lt|Maj|'
@@ -199,16 +216,12 @@ if "--install-packages" not in sys.argv:
 
     def _robust_sentence_split(text):
         """Split text into individual sentences, respecting abbreviations,
-        decimal numbers, ellipses, and single-letter initials like U.S.A.
-        
-        This is the low-level splitter — it returns one sentence per element.
-        """
+        decimal numbers, ellipses, and single-letter initials like U.S.A."""
         if not text or not text.strip():
             return [text.strip()] if text and text.strip() else []
 
         text = text.strip()
 
-        # --- Step 1: Shield patterns that look like sentence endings ---
         shields = {}
         _cnt = [0]
 
@@ -219,49 +232,34 @@ if "--install-packages" not in sys.argv:
             return key
 
         protected = text
-        # Shield abbreviations followed by space (Mr. Smith → keep together)
         protected = _re.sub(
             r'\b' + _ABBREV_PATTERN + r'\.\s',
             _shield, protected, flags=_re.IGNORECASE
         )
-        # Shield decimal numbers (3.14, $2.50, 0.001)
         protected = _re.sub(r'\d+\.\d+', _shield, protected)
-        # Shield ellipses (... or …)
         protected = _re.sub(r'\.{2,}', _shield, protected)
         protected = _re.sub(r'…', _shield, protected)
-        # Shield single-letter initials (U.S.A., J.K., D.C.)
         protected = _re.sub(r'(?:[A-Z]\.){2,}', _shield, protected)
-        # Shield URLs (http://..., www....)
         protected = _re.sub(r'https?://\S+', _shield, protected)
         protected = _re.sub(r'www\.\S+', _shield, protected)
-        # Shield time patterns (10.30, 5.00 when preceded by "at" or similar)
         protected = _re.sub(r'\b\d{1,2}\.\d{2}\b', _shield, protected)
 
-        # --- Step 2: Split on real sentence boundaries ---
-        # Split after .!? when followed by:
-        #   - whitespace + uppercase letter (Latin)
-        #   - whitespace + Devanagari (Hindi)
-        #   - whitespace + CJK character (Chinese)
-        #   - whitespace + Dravidian script (Telugu/Tamil/Kannada)
-        #   - whitespace + digit (numbered lists)
-        #   - whitespace + quote mark
         parts = _re.split(
             r'(?<=[.!?])\s+'
             r'(?=['
-            r'A-Z'                   # Latin uppercase
-            r'\u0900-\u097F'         # Devanagari (Hindi)
-            r'\u4e00-\u9fff'         # CJK (Chinese)
-            r'\u0C00-\u0C7F'         # Telugu
-            r'\u0B80-\u0BFF'         # Tamil
-            r'\u0C80-\u0CFF'         # Kannada
-            r'0-9'                   # Numbered items
-            r'"\u201C\u201D'         # Quotation marks
-            r"'"                     # Apostrophe/single quote
+            r'A-Z'
+            r'\u0900-\u097F'
+            r'\u4e00-\u9fff'
+            r'\u0C00-\u0C7F'
+            r'\u0B80-\u0BFF'
+            r'\u0C80-\u0CFF'
+            r'0-9'
+            r'"\u201C\u201D'
+            r"'"
             r'])',
             protected
         )
 
-        # --- Step 3: Restore shielded patterns ---
         result = []
         for part in parts:
             for key, val in shields.items():
@@ -273,12 +271,7 @@ if "--install-packages" not in sys.argv:
         return result if result else [text]
 
     def _group_sentences(sentences, max_chunk_chars=450):
-        """Group sentences into translation-sized chunks to preserve context.
-
-        Keeping 2-3 sentences together lets the translation model see
-        inter-sentence context (pronouns, topic continuity) which produces
-        much better paragraph translation than sentence-by-sentence.
-        """
+        """Group sentences into translation-sized chunks to preserve context."""
         if not sentences:
             return []
         if len(sentences) == 1:
@@ -290,14 +283,13 @@ if "--install-packages" not in sys.argv:
 
         for sent in sentences:
             sent_len = len(sent)
-            # Start new chunk if adding this sentence would exceed limit
             if current_len + sent_len > max_chunk_chars and current_group:
                 chunks.append(' '.join(current_group))
                 current_group = [sent]
                 current_len = sent_len
             else:
                 current_group.append(sent)
-                current_len += sent_len + 1  # +1 for the joining space
+                current_len += sent_len + 1
 
         if current_group:
             chunks.append(' '.join(current_group))
@@ -305,25 +297,15 @@ if "--install-packages" not in sys.argv:
         return chunks if chunks else sentences
 
     def _offline_split(text, lang_code=None):
-        """Smart offline text chunking for translation.
-
-        Strategy:
-          • Short text  (< 500 chars):  return as single chunk — no splitting
-            ↳ The translation model sees full context → best quality
-          • Medium text (500–2000 chars): split into sentences, group 2-3 together
-            ↳ Preserves inter-sentence context while staying within model limits
-          • Long text   (> 2000 chars):  paragraph-aware splitting with grouping
-        """
+        """Smart offline text chunking for Argos translation."""
         if not text or not text.strip():
             return []
 
         text = text.strip()
 
-        # SHORT TEXT: translate as one unit for maximum context retention
         if len(text) < 500:
             return [text]
 
-        # LONGER TEXT: split into paragraphs first, then chunk within each
         paragraphs = _re.split(r'\n\s*\n', text)
 
         all_chunks = []
@@ -333,30 +315,28 @@ if "--install-packages" not in sys.argv:
                 continue
 
             if len(para) < 500:
-                # Short paragraph: keep as one chunk
                 all_chunks.append(para)
             else:
-                # Long paragraph: split into sentences and group
                 sentences = _robust_sentence_split(para)
                 grouped = _group_sentences(sentences, max_chunk_chars=450)
                 all_chunks.extend(grouped)
 
         return all_chunks if all_chunks else [text]
 
-    # Override all sentence detection functions with our improved version
     if hasattr(_sbd, 'detect_sentences'):
         _sbd.detect_sentences = _offline_split
     if hasattr(_sbd, 'split_sentences'):
         _sbd.split_sentences = _offline_split
 
-# MarianMT (OPUS-MT) for Telugu, Tamil, Kannada
+# NLLB-200 (Hugging Face transformers) for Telugu, Tamil, Kannada
 try:
-    from transformers import MarianMTModel, MarianTokenizer
-    MARIAN_AVAILABLE = True
+    import ctranslate2
+    from transformers import AutoTokenizer
+    NLLB_AVAILABLE = True
 except ImportError:
-    MARIAN_AVAILABLE = False
-    print("[INFO] transformers not found – Telugu/Tamil/Kannada translation disabled.")
-    print("       Run: pip install transformers sentencepiece")
+    NLLB_AVAILABLE = False
+    print("[INFO] ctranslate2/transformers not found – Telugu/Tamil/Kannada translation disabled.")
+    print("       Run: pip install ctranslate2 transformers sentencepiece")
 
 try:
     import vosk
@@ -426,9 +406,6 @@ PIPER_MODELS = {
     "te": "te_IN-maya-medium.onnx",
 }
 
-# Vosk models — LARGER models first (much better accuracy), small as fallback.
-# The loader tries each in order and uses the first one found on disk.
-# Run --install-packages to download larger models, or manually place them in ~/vosk-models/
 VOSK_MODEL_PRIORITY = {
     "en": ["vosk-model-en-us-0.22-lgraph",  "vosk-model-en-us-0.22",  "vosk-model-small-en-us-0.15"],
     "hi": ["vosk-model-hi-0.22",             "vosk-model-small-hi-0.22"],
@@ -438,27 +415,11 @@ VOSK_MODEL_PRIORITY = {
     "de": ["vosk-model-de-0.21",             "vosk-model-small-de-0.15"],
     "te": ["vosk-model-small-te-0.42"],
     # NOTE: No Vosk models exist for Tamil (ta) or Kannada (kn).
-    #       Voice input is keyboard-only for those languages.
 }
 
-# Backward-compat: flat map used by error messages
 VOSK_MODEL_NAMES = {k: v[0] for k, v in VOSK_MODEL_PRIORITY.items()}
 
 VOSK_MODELS_DIR = Path.home() / "vosk-models"
-
-# Languages that use MarianMT (OPUS-MT) instead of Argos Translate
-MARIAN_LANGUAGES = {"te", "ta", "kn"}
-
-# OPUS-MT target language tokens for the en→dra model
-MARIAN_LANG_TOKENS = {
-    "te": ">>tel<<",
-    "ta": ">>tam<<",
-    "kn": ">>kan<<",
-}
-
-# Model names on HuggingFace (downloaded once, then cached locally)
-MARIAN_MODEL_EN_DRA = "Helsinki-NLP/opus-mt-en-dra"   # English → Dravidian
-MARIAN_MODEL_DRA_EN = "Helsinki-NLP/opus-mt-dra-en"   # Dravidian → English
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -469,11 +430,8 @@ def _preprocess_text(text: str) -> str:
     """Normalise whitespace and clean input before translation."""
     if not text:
         return text
-    # Collapse runs of spaces/tabs into single space
     text = _re.sub(r'[ \t]+', ' ', text)
-    # Collapse 3+ newlines into double newline (paragraph break)
     text = _re.sub(r'\n{3,}', '\n\n', text)
-    # Ensure space after sentence-ending punctuation if missing
     text = _re.sub(r'([.!?])([A-Z\u0900-\u097F\u4e00-\u9fff\u0C00-\u0C7F\u0B80-\u0BFF\u0C80-\u0CFF])', r'\1 \2', text)
     return text.strip()
 
@@ -482,18 +440,13 @@ def _postprocess_text(text: str) -> str:
     """Clean up common translation artifacts."""
     if not text:
         return text
-    # Fix multiple consecutive spaces
     text = _re.sub(r'  +', ' ', text)
-    # Remove stray spaces before punctuation
     text = _re.sub(r'\s+([.!?,;:。！？，；：])', r'\1', text)
-    # Add space after punctuation when directly followed by a word char
-    # (but not for decimal numbers or abbreviations)
     text = _re.sub(
         r'([.!?,;:])([A-Za-z\u0900-\u097F\u4e00-\u9fff\u0C00-\u0C7F\u0B80-\u0BFF\u0C80-\u0CFF])',
         r'\1 \2',
         text
     )
-    # Fix repeated punctuation from model artifacts (e.g. "....." → "...")
     text = _re.sub(r'([.!?])\1{2,}', r'\1\1\1', text)
     return text.strip()
 
@@ -506,22 +459,23 @@ _translation_cache: dict = {}
 
 # ── Argos Translate helpers (for en/hi/fr/zh/es/de) ──────────────────────────
 
+def _nllb_is_cached() -> bool:
+    """Check that the downloaded NLLB int8 model exists on disk."""
+    return (NLLB_DIR / "model.bin").exists()
+
+
 def _is_pair_installed(src_code: str, tgt_code: str) -> bool:
-    """Check if a translation pair is ready (Argos or MarianMT)."""
-    src_marian = src_code in MARIAN_LANGUAGES
-    tgt_marian = tgt_code in MARIAN_LANGUAGES
+    """Check if a translation pair is ready (Argos or NLLB)."""
+    if src_code in DRAVIDIAN_LANGUAGES or tgt_code in DRAVIDIAN_LANGUAGES:
+        return NLLB_AVAILABLE and (NLLB_MODEL in _nllb_cache or _nllb_is_cached())
 
-    # If either language is Dravidian, use MarianMT
-    if src_marian or tgt_marian:
-        return MARIAN_AVAILABLE
-
-    # Otherwise check Argos
     installed = argostranslate.translate.get_installed_languages()
     src_lang = next((l for l in installed if l.code == src_code), None)
     tgt_lang = next((l for l in installed if l.code == tgt_code), None)
     if src_lang is None or tgt_lang is None:
         return False
     return src_lang.get_translation(tgt_lang) is not None
+
 
 def _get_translation_obj(src_code: str, tgt_code: str):
     key = (src_code, tgt_code)
@@ -541,117 +495,119 @@ def _get_translation_obj(src_code: str, tgt_code: str):
     return translation
 
 
-# ── MarianMT helpers (for te/ta/kn) ──────────────────────────────────────────
+# ── NLLB helpers (for te/ta/kn) ──────────────────────────────────────────────
 
-_marian_model_cache: dict = {}  # {model_name: (tokenizer, model)}
+_nllb_cache: dict = {}  # {model_name: (tokenizer, model)}
+_nllb_lock = threading.Lock()
 
 
-def _load_marian_model(model_name: str):
-    """Load a MarianMT model from local HuggingFace cache (no network)."""
-    if model_name in _marian_model_cache:
-        return _marian_model_cache[model_name]
-
-    if not MARIAN_AVAILABLE:
+def _load_nllb():
+    """Load the int8 NLLB model from disk (no network). Loaded lazily, only
+    when a Telugu/Tamil/Kannada translation is requested."""
+    if NLLB_MODEL in _nllb_cache:
+        return _nllb_cache[NLLB_MODEL]
+    if not NLLB_AVAILABLE:
         return None
+    with _nllb_lock:
+        if NLLB_MODEL in _nllb_cache:
+            return _nllb_cache[NLLB_MODEL]
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(str(NLLB_DIR), local_files_only=True)
+            translator = ctranslate2.Translator(
+                str(NLLB_DIR),
+                device="cpu",
+                compute_type="int8",
+                inter_threads=1,
+                intra_threads=4,
+            )
+            _nllb_cache[NLLB_MODEL] = (tokenizer, translator)
+            return (tokenizer, translator)
+        except Exception as e:
+            print(f"[NLLB load error for {NLLB_DIR}]: {e}")
+            return None
 
-    try:
-        tokenizer = MarianTokenizer.from_pretrained(model_name, local_files_only=True)
-        model = MarianMTModel.from_pretrained(model_name, local_files_only=True)
-        _marian_model_cache[model_name] = (tokenizer, model)
-        return (tokenizer, model)
-    except Exception as e:
-        print(f"[MarianMT load error for {model_name}]: {e}")
-        return None
+
+def _unload_nllb():
+    """Free NLLB memory (called when no South Indian language is selected)."""
+    with _nllb_lock:
+        _nllb_cache.pop(NLLB_MODEL, None)
+    import gc
+    gc.collect()
 
 
-def _marian_translate(text: str, model_name: str, lang_token: str = "") -> str:
-    """Translate using a MarianMT model with context-aware chunking.
+def _nllb_translate_chunk(tokenizer, translator, chunk: str, src_code: str, tgt_code: str) -> str:
+    """Translate one sentence/chunk with NLLB (CTranslate2)."""
+    chunk = chunk.strip()
+    if not chunk:
+        return ""
 
-    For short text:  translate as a single unit (best quality).
-    For long text:   split into sentence-grouped chunks, translate each,
-                     and rejoin with proper spacing.
+    tokenizer.src_lang = NLLB_CODES[src_code]
+    ids = tokenizer(chunk, truncation=True, max_length=256).input_ids
+    tokens = tokenizer.convert_ids_to_tokens(ids)
+    max_new = min(400, max(32, int(len(tokens) * 2.5) + 16))
+
+    results = translator.translate_batch(
+        [tokens],
+        target_prefix=[[NLLB_CODES[tgt_code]]],
+        beam_size=4,
+        max_decoding_length=max_new,
+        no_repeat_ngram_size=4,
+        repetition_penalty=1.1,
+    )
+    hyp = results[0].hypotheses[0]
+    if hyp and hyp[0] == NLLB_CODES[tgt_code]:
+        hyp = hyp[1:]
+    result = tokenizer.decode(
+        tokenizer.convert_tokens_to_ids(hyp), skip_special_tokens=True
+    ).strip()
+    print(f"[NLLB {src_code}→{tgt_code}] '{chunk[:60]}' -> '{result[:60]}'")
+    return result
+
+
+def _nllb_translate(text: str, src_code: str, tgt_code: str) -> str:
+    """Translate directly between any two supported languages with NLLB.
+
+    NLLB is trained on sentence-level data, so text is split into sentences
+    (short sentences are grouped up to ~200 chars) and paragraphs are kept.
     """
-    pair = _load_marian_model(model_name)
+    pair = _load_nllb()
     if pair is None:
         return (
-            f"[OPUS-MT model not cached: {model_name}]\n"
+            f"[NLLB model not found in {NLLB_DIR}]\n"
             f"Run: ./lingo_env/bin/python test2.py --install-packages"
         )
     tokenizer, model = pair
 
     text = _preprocess_text(text)
 
-    def _translate_chunk(chunk: str) -> str:
-        """Translate a single chunk through MarianMT."""
-        src_text = f"{lang_token} {chunk}".strip() if lang_token else chunk
-        print(f"[MarianMT] Input: '{src_text}' | Model: {model_name}")
+    def _translate_block(block: str) -> str:
+        if len(block) <= 200:
+            return _nllb_translate_chunk(tokenizer, model, block, src_code, tgt_code)
+        sentences = _robust_sentence_split(block)
+        chunks = _group_sentences(sentences, max_chunk_chars=200)
+        out = []
+        for ch in chunks:
+            r = _nllb_translate_chunk(tokenizer, model, ch, src_code, tgt_code)
+            out.append(r if r else ch)
+        return ' '.join(out)
 
-        inputs = tokenizer(
-            src_text,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
-        )
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=1024,
-            num_beams=5,
-            length_penalty=1.0,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
-        )
-        result = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"[MarianMT] Output: '{result}'")
+    try:
+        parts = _re.split(r'(\n\s*\n)', text)
+        translated = []
+        for part in parts:
+            if not part.strip():
+                translated.append(part)
+                continue
+            # keep single line breaks as separate blocks
+            lines = [ln for ln in part.split('\n') if ln.strip()]
+            translated.append('\n'.join(_translate_block(ln.strip()) for ln in lines))
+        final = ''.join(translated)
+    except Exception as e:
+        return f"[NLLB error: {e}]"
 
-        if result and result.strip():
-            return result.strip()
-
-        # Fallback: try without skipping special tokens to see raw output
-        raw = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        print(f"[MarianMT] Raw output: '{raw}'")
-        if raw and raw.strip():
-            for tok in ["</s>", "<pad>", "<s>", "<unk>"]:
-                raw = raw.replace(tok, "")
-            if raw.strip():
-                return raw.strip()
-        return ""
-
-    # SHORT TEXT (< 400 chars): translate as one unit for best context
-    if len(text) < 400:
-        result = _translate_chunk(text)
-        if result:
-            return _postprocess_text(result)
-        return "[No result — model may not support this language pair]"
-
-    # LONGER TEXT: split into smart chunks and translate each
-    # Preserve paragraph structure
-    paragraphs = _re.split(r'(\n\s*\n)', text)
-    translated_parts = []
-
-    for part in paragraphs:
-        # Preserve paragraph break whitespace as-is
-        if not part.strip():
-            translated_parts.append(part)
-            continue
-
-        if len(part) < 400:
-            result = _translate_chunk(part)
-            translated_parts.append(result if result else part)
-        else:
-            # Split into sentences and group into chunks
-            sentences = _robust_sentence_split(part)
-            chunks = _group_sentences(sentences, max_chunk_chars=350)
-            chunk_results = []
-            for chunk in chunks:
-                result = _translate_chunk(chunk)
-                chunk_results.append(result if result else chunk)
-            translated_parts.append(' '.join(chunk_results))
-
-    final = ''.join(translated_parts)
     if final.strip():
         return _postprocess_text(final)
-    return "[No result — model may not support this language pair]"
+    return "[No result — model returned empty output]"
 
 
 # ── Unified translate function ───────────────────────────────────────────────
@@ -661,55 +617,22 @@ def do_translate(text: str, src_code: str, tgt_code: str) -> str:
     if src_code == tgt_code:
         return text
 
-    src_marian = src_code in MARIAN_LANGUAGES
-    tgt_marian = tgt_code in MARIAN_LANGUAGES
-
     try:
-        # Case 1: Both are Dravidian → pivot through English (te→en→ta)
-        if src_marian and tgt_marian:
-            english = _marian_translate(text, MARIAN_MODEL_DRA_EN)
-            if english.startswith("["):
-                return english  # Error
-            token = MARIAN_LANG_TOKENS.get(tgt_code, "")
-            return _marian_translate(english, MARIAN_MODEL_EN_DRA, token)
+        # Any pair involving Telugu / Tamil / Kannada → NLLB, direct (no pivot)
+        if src_code in DRAVIDIAN_LANGUAGES or tgt_code in DRAVIDIAN_LANGUAGES:
+            return _nllb_translate(text, src_code, tgt_code)
 
-        # Case 2: Source is Dravidian → translate to English first, then Argos
-        if src_marian and not tgt_marian:
-            english = _marian_translate(text, MARIAN_MODEL_DRA_EN)
-            if english.startswith("["):
-                return english
-            if tgt_code == "en":
-                return english
-            # English → target via Argos
-            return _argos_translate(english, "en", tgt_code)
-
-        # Case 3: Target is Dravidian → Argos to English first, then MarianMT
-        if tgt_marian and not src_marian:
-            if src_code == "en":
-                english = text
-            else:
-                english = _argos_translate(text, src_code, "en")
-                if english.startswith("["):
-                    return english
-            token = MARIAN_LANG_TOKENS.get(tgt_code, "")
-            return _marian_translate(english, MARIAN_MODEL_EN_DRA, token)
-
-        # Case 4: Neither is Dravidian → pure Argos
+        # Everything else → Argos (unchanged)
         return _argos_translate(text, src_code, tgt_code)
 
     except Exception as e:
-        return f"[Translation error: {e}]"
+        import traceback
+        traceback.print_exc()   # full details go to the terminal
+        return f"[Translation error: {type(e).__name__}: {e}]"
 
 
 def _argos_translate(text: str, src_code: str, tgt_code: str) -> str:
-    """Translate using Argos Translate with context-aware chunking.
-
-    Strategy:
-      • Short text  (< 500 chars):  pass as single unit to Argos
-        ↳ Our overridden sbd returns it as-is → model sees full context
-      • Longer text:  split into paragraphs, then smart-chunk each paragraph
-        ↳ Each chunk keeps 2-3 sentences together for inter-sentence context
-    """
+    """Translate using Argos Translate with context-aware chunking."""
     t = _get_translation_obj(src_code, tgt_code)
     if t is None:
         return (
@@ -719,28 +642,22 @@ def _argos_translate(text: str, src_code: str, tgt_code: str) -> str:
 
     text = _preprocess_text(text)
 
-    # SHORT TEXT: let Argos translate as a single unit
-    # Our overridden _offline_split (in sbd) returns text <500 chars as-is,
-    # so Argos will translate the whole thing without splitting → best quality.
     if len(text) < 500:
         result = t.translate(text)
         return _postprocess_text(result.strip()) if result else "[No result]"
 
-    # LONGER TEXT: manually chunk and translate for paragraph coherence
     paragraphs = _re.split(r'(\n\s*\n)', text)
     translated_parts = []
 
     for part in paragraphs:
         if not part.strip():
-            translated_parts.append(part)  # preserve paragraph breaks
+            translated_parts.append(part)
             continue
 
         if len(part) < 500:
-            # Short paragraph: translate as one unit
             result = t.translate(part)
             translated_parts.append(result.strip() if result else part)
         else:
-            # Long paragraph: split into sentences, group into chunks
             sentences = _robust_sentence_split(part)
             chunks = _group_sentences(sentences, max_chunk_chars=450)
             chunk_results = []
@@ -758,14 +675,11 @@ def _argos_translate(text: str, src_code: str, tgt_code: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _vosk_model_cache: dict = {}
-_vosk_active_model_name: dict = {}  # lang_code → model name that was loaded
+_vosk_active_model_name: dict = {}
 
 
 def get_vosk_model(lang_code: str):
-    """Load the best available Vosk model for a language.
-
-    Tries larger, more accurate models first and falls back to small ones.
-    """
+    """Load the best available Vosk model for a language."""
     if not VOSK_AVAILABLE:
         return None
     if lang_code in _vosk_model_cache:
@@ -775,7 +689,6 @@ def get_vosk_model(lang_code: str):
     if not candidates:
         return None
 
-    # Try each model in priority order (largest/best first)
     for model_name in candidates:
         model_path = VOSK_MODELS_DIR / model_name
         if model_path.exists():
@@ -795,58 +708,41 @@ def get_vosk_model(lang_code: str):
 
 
 def _normalise_audio(raw_bytes: bytes, target_rms: float = 3000.0) -> bytes:
-    """Normalise audio volume so quiet speech is boosted for better recognition.
-
-    Vosk works best when audio RMS is around 2000-4000.  If the mic is quiet
-    (RMS < 500) recognition accuracy drops drastically.  This function
-    measures the current RMS and applies gain to bring it to `target_rms`.
-    """
+    """Normalise audio volume so quiet speech is boosted for better recognition."""
     n_samples = len(raw_bytes) // 2
     if n_samples == 0:
         return raw_bytes
 
     samples = struct.unpack(f'<{n_samples}h', raw_bytes)
 
-    # Calculate RMS (root mean square) of the audio
     sum_sq = sum(s * s for s in samples)
     rms = math.sqrt(sum_sq / n_samples) if n_samples > 0 else 0.0
 
     if rms < 10.0:
-        # Silence — don't amplify noise
         return raw_bytes
 
-    # Calculate gain factor (cap at 10x to avoid blowing up noise)
     gain = min(target_rms / rms, 10.0)
 
     if 0.8 <= gain <= 1.2:
-        # Already at good level — skip processing
         return raw_bytes
 
-    # Apply gain and clamp to int16 range
     boosted = []
     for s in samples:
         v = int(s * gain)
-        v = max(-32768, min(32767, v))  # clamp to int16
+        v = max(-32768, min(32767, v))
         boosted.append(v)
 
     return struct.pack(f'<{n_samples}h', *boosted)
 
 
 def _filter_by_confidence(result_json: dict, min_conf: float = 0.45) -> str:
-    """Filter recognised words by confidence score.
-
-    Low-confidence words are often misrecognitions.  If word-level results
-    are available, keep only words above `min_conf`.  Falls back to the
-    plain text if no word-level data.
-    """
-    # If word-level results are available, filter by confidence
+    """Filter recognised words by confidence score."""
     words = result_json.get("result", [])
     if words:
         kept = [w["word"] for w in words if w.get("conf", 1.0) >= min_conf]
         if kept:
             return " ".join(kept)
 
-    # Fallback to plain text result
     return result_json.get("text", "").strip()
 
 
@@ -854,9 +750,8 @@ class VoiceRecorder:
     SAMPLERATE = 16000
     CHANNELS   = 1
     DTYPE      = "int16"
-    BLOCKSIZE  = 4000   # 250ms blocks (was 500ms) — more responsive
+    BLOCKSIZE  = 4000
 
-    # Confidence threshold: words below this are likely misrecognitions
     MIN_CONFIDENCE = 0.45
 
     def __init__(self, lang_code, on_result, on_partial, on_error):
@@ -891,7 +786,6 @@ class VoiceRecorder:
 
         q = queue.Queue()
         rec = vosk.KaldiRecognizer(model, self.SAMPLERATE)
-        # Enable word-level results with confidence scores
         rec.SetWords(True)
         rec.SetPartialWords(True)
         full_text = []
@@ -913,12 +807,10 @@ class VoiceRecorder:
                     except queue.Empty:
                         continue
 
-                    # Normalise audio volume for better recognition
                     data = _normalise_audio(data)
 
                     if rec.AcceptWaveform(data):
                         r = json.loads(rec.Result())
-                        # Use confidence-filtered words instead of raw text
                         word = _filter_by_confidence(r, self.MIN_CONFIDENCE)
                         if word:
                             full_text.append(word)
@@ -929,7 +821,6 @@ class VoiceRecorder:
                         if partial:
                             self.on_partial(" ".join(full_text + [partial]))
 
-            # Final result with confidence filtering
             r = json.loads(rec.FinalResult())
             word = _filter_by_confidence(r, self.MIN_CONFIDENCE)
             if word:
@@ -974,7 +865,6 @@ def speak(text: str, lang_code: str):
             except Exception as e:
                 print(f"[Piper error]: {e}")
 
-    # Fallback: espeak-ng
     espeak_voices = {
         "en": "en-us", "hi": "hi", "fr": "fr",
         "zh": "zh",    "es": "es", "de": "de",
@@ -1052,7 +942,6 @@ class OffLingoApp:
         main = tk.Frame(self.root, bg=C["bg"])
         main.pack(fill="both", expand=True, padx=4, pady=2)
 
-        # ROW 1: title + selectors + swap + exit
         row1 = tk.Frame(main, bg=C["bg"])
         row1.pack(fill="x", pady=(0, 2))
 
@@ -1099,10 +988,8 @@ class OffLingoApp:
         self.dir_label.pack(side="right", padx=(4, 0))
         self._update_dir_label()
 
-        # Separator
         tk.Frame(main, bg=C["sep"], height=1).pack(fill="x", pady=(1, 2))
 
-        # ROW 2: input box
         in_wrap = tk.Frame(
             main, bg=C["border"],
             highlightthickness=1,
@@ -1127,7 +1014,6 @@ class OffLingoApp:
         self.input_text.bind("<KeyRelease>", self._update_char_count)
         self.input_text.focus_set()
 
-        # ROW 3: buttons
         btn_row = tk.Frame(main, bg=C["bg"])
         btn_row.pack(fill="x", pady=(2, 2))
 
@@ -1173,7 +1059,6 @@ class OffLingoApp:
         )
         self.char_count.pack(side="right", padx=(0, 2))
 
-        # ROW 4: output box
         out_wrap = tk.Frame(
             main, bg=C["border"],
             highlightthickness=1,
@@ -1193,7 +1078,6 @@ class OffLingoApp:
         )
         self.output_text.pack(fill="both", expand=True)
 
-        # ROW 5: status bar
         st = tk.Frame(main, bg=C["bg"])
         st.pack(fill="x")
         self.status_lbl = tk.Label(
@@ -1280,6 +1164,10 @@ class OffLingoApp:
         var.set(name)
         self._update_dir_label()
         self._refresh_status()
+        # Free the NLLB model (RAM) when no South Indian language is selected
+        codes = {LANGUAGES[self.src_lang.get()], LANGUAGES[self.tgt_lang.get()]}
+        if not (codes & DRAVIDIAN_LANGUAGES) and NLLB_MODEL in _nllb_cache:
+            threading.Thread(target=_unload_nllb, daemon=True).start()
 
     def _swap_languages(self, _=None):
         s, t = self.src_lang.get(), self.tgt_lang.get()
@@ -1318,7 +1206,6 @@ class OffLingoApp:
             self._set_status("Same language – showing input as-is.", ok=True)
             return
 
-        # Block if package not installed — no network calls
         if not _is_pair_installed(src_code, tgt_code):
             self._set_status(
                 f"⚠ Package {src_code}→{tgt_code} missing. Run --install-packages",
@@ -1466,7 +1353,8 @@ class OffLingoApp:
             self._set_status("Same language selected.", ok=True)
             self.model_lbl.configure(text="")
             return
-        cached    = (src_code, tgt_code) in _translation_cache
+        uses_nllb = src_code in DRAVIDIAN_LANGUAGES or tgt_code in DRAVIDIAN_LANGUAGES
+        cached    = (NLLB_MODEL in _nllb_cache) if uses_nllb else ((src_code, tgt_code) in _translation_cache)
         installed = _is_pair_installed(src_code, tgt_code)
         if cached:
             label, color = "✓ cached", C["ok"]
