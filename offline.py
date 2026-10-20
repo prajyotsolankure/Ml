@@ -325,6 +325,19 @@ if "--install-packages" not in sys.argv:
     if hasattr(_sbd, 'split_sentences'):
         _sbd.split_sentences = _offline_split
 
+    # Argos 1.11+ splits sentences with *sentencizer classes* (Stanza / spaCy /
+    # MiniSBD) whose Stanza version crashes offline with KeyError 'packages'.
+    # Replace split_sentences on every such class with our regex splitter.
+    def _class_split_sentences(self, text):
+        return _offline_split(text)
+
+    for _name, _obj in list(vars(_sbd).items()):
+        if isinstance(_obj, type) and hasattr(_obj, 'split_sentences'):
+            try:
+                _obj.split_sentences = _class_split_sentences
+            except Exception:
+                pass
+
 # NLLB-200 (Hugging Face transformers) for Telugu, Tamil, Kannada
 try:
     import ctranslate2
