@@ -17,7 +17,7 @@ Features:
 
 Pre-install packages (run ONCE while online):
     cd /home/pns/Desktop/Trasnlator
-    ./lingo_env/bin/pip install ctranslate2 transformers sentencepiece huggingface_hub
+    ./lingo_env/bin/pip install ctranslate2 sentencepiece huggingface_hub
     ./lingo_env/bin/python test2.py --install-packages
 """
 
@@ -67,6 +67,8 @@ DRAVIDIAN_LANGUAGES = {"te", "ta", "kn"}
 NLLB_REPO = "Code-Dev/nllb-200-distilled-600M-ct2-int8"
 NLLB_DIR  = Path.home() / "nllb-ct2"
 NLLB_MODEL = str(NLLB_DIR)   # key used for the in-memory cache
+NLLB_SPM   = NLLB_DIR / "sentencepiece.bpe.model"   # light tokenizer (no transformers)
+NLLB_SPM_FALLBACK_REPO = "olob0/nllb-200-distilled-600M-ct2-int8_float16"
 
 # App language code -> NLLB (FLORES-200) code
 NLLB_CODES = {
@@ -152,32 +154,27 @@ def cli_install_packages():
     print("\n--- 3. Downloading NLLB-200 int8 (Telugu, Tamil, Kannada) ---")
     print(f"     (about 600 MB → {NLLB_DIR})")
     try:
-        from huggingface_hub import snapshot_download
-        import ctranslate2
-        from transformers import AutoTokenizer
+        from huggingface_hub import snapshot_download, hf_hub_download
 
         # Files are written straight to disk — no big in-RAM model rebuild.
         snapshot_download(repo_id=NLLB_REPO, local_dir=str(NLLB_DIR))
         print(f"  [OK]   {NLLB_REPO}")
 
-        print("  Warming up NLLB for te / ta / kn ...")
-        tok = AutoTokenizer.from_pretrained(str(NLLB_DIR))
-        tr = ctranslate2.Translator(str(NLLB_DIR), device="cpu", compute_type="int8")
-        for code in ("te", "ta", "kn"):
-            try:
-                tok.src_lang = NLLB_CODES["en"]
-                toks = tok.convert_ids_to_tokens(tok("Hello, how are you?").input_ids)
-                res = tr.translate_batch([toks], target_prefix=[[NLLB_CODES[code]]])
-                hyp = res[0].hypotheses[0]
-                if hyp and hyp[0] == NLLB_CODES[code]:
-                    hyp = hyp[1:]
-                print(f"  [OK]   en→{code}: "
-                      f"{tok.decode(tok.convert_tokens_to_ids(hyp), skip_special_tokens=True)}")
-            except Exception as e:
-                print(f"  [FAIL] NLLB warm-up en→{code}: {e}")
+        # The sentencepiece tokenizer file is required; fetch it if missing.
+        if not NLLB_SPM.exists():
+            print("  Fetching sentencepiece.bpe.model ...")
+            hf_hub_download(repo_id=NLLB_SPM_FALLBACK_REPO,
+                            filename="sentencepiece.bpe.model",
+                            local_dir=str(NLLB_DIR))
+        print(f"  [OK]   tokenizer: {NLLB_SPM.exists()}")
+
+        # Warm-up runs in a FRESH process so Stanza/Argos memory used above
+        # doesn't push the 2 GB Pi into the out-of-memory killer.
+        print("  Warming up NLLB for te / ta / kn (separate process) ...")
+        subprocess.run([sys.executable, os.path.abspath(__file__), "--nllb-test"])
     except ImportError as e:
         print(f"  [SKIP] missing package ({e}). "
-              "Run: pip install ctranslate2 transformers sentencepiece huggingface_hub")
+              "Run: pip install ctranslate2 sentencepiece huggingface_hub")
     except Exception as e:
         print(f"  [FAIL] {NLLB_REPO}: {e}")
 
@@ -331,12 +328,12 @@ if "--install-packages" not in sys.argv:
 # NLLB-200 (Hugging Face transformers) for Telugu, Tamil, Kannada
 try:
     import ctranslate2
-    from transformers import AutoTokenizer
+    import sentencepiece as spm
     NLLB_AVAILABLE = True
 except ImportError:
     NLLB_AVAILABLE = False
-    print("[INFO] ctranslate2/transformers not found – Telugu/Tamil/Kannada translation disabled.")
-    print("       Run: pip install ctranslate2 transformers sentencepiece")
+    print("[INFO] ctranslate2/sentencepiece not found – Telugu/Tamil/Kannada translation disabled.")
+    print("       Run: pip install ctranslate2 sentencepiece")
 
 try:
     import vosk
@@ -461,7 +458,7 @@ _translation_cache: dict = {}
 
 def _nllb_is_cached() -> bool:
     """Check that the downloaded NLLB int8 model exists on disk."""
-    return (NLLB_DIR / "model.bin").exists()
+    return (NLLB_DIR / "model.bin").exists() and NLLB_SPM.exists()
 
 
 def _is_pair_installed(src_code: str, tgt_code: str) -> bool:
@@ -512,7 +509,8 @@ def _load_nllb():
         if NLLB_MODEL in _nllb_cache:
             return _nllb_cache[NLLB_MODEL]
         try:
-            tokenizer = AutoTokenizer.from_pretrained(str(NLLB_DIR), local_files_only=True)
+            tokenizer = spm.SentencePieceProcessor()
+            tokenizer.Load(str(NLLB_SPM))
             translator = ctranslate2.Translator(
                 str(NLLB_DIR),
                 device="cpu",
@@ -541,9 +539,9 @@ def _nllb_translate_chunk(tokenizer, translator, chunk: str, src_code: str, tgt_
     if not chunk:
         return ""
 
-    tokenizer.src_lang = NLLB_CODES[src_code]
-    ids = tokenizer(chunk, truncation=True, max_length=256).input_ids
-    tokens = tokenizer.convert_ids_to_tokens(ids)
+    # NLLB input format: [src_lang_code] + sentencepiece pieces + [</s>]
+    pieces = tokenizer.encode(chunk, out_type=str)[:250]
+    tokens = [NLLB_CODES[src_code]] + pieces + ["</s>"]
     max_new = min(400, max(32, int(len(tokens) * 2.5) + 16))
 
     results = translator.translate_batch(
@@ -557,9 +555,8 @@ def _nllb_translate_chunk(tokenizer, translator, chunk: str, src_code: str, tgt_
     hyp = results[0].hypotheses[0]
     if hyp and hyp[0] == NLLB_CODES[tgt_code]:
         hyp = hyp[1:]
-    result = tokenizer.decode(
-        tokenizer.convert_tokens_to_ids(hyp), skip_special_tokens=True
-    ).strip()
+    hyp = [t for t in hyp if t not in ("</s>", "<s>", "<pad>")]
+    result = tokenizer.decode(hyp).strip()
     print(f"[NLLB {src_code}→{tgt_code}] '{chunk[:60]}' -> '{result[:60]}'")
     return result
 
@@ -1372,6 +1369,13 @@ class OffLingoApp:
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__" and "--nllb-test" in sys.argv:
+    # Quick offline self-test of NLLB: ./lingo_env/bin/python test2.py --nllb-test
+    for _code in ("te", "ta", "kn"):
+        print(f"en→{_code}:", do_translate("Hello, how are you? I am going to the market.", "en", _code))
+    print("te→en:", do_translate("మీరు ఎలా ఉన్నారు?", "te", "en"))
+    sys.exit(0)
 
 if __name__ == "__main__":
     root = tk.Tk()
